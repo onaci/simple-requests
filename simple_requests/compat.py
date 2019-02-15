@@ -9,6 +9,7 @@ else:
     from httplib import HTTPResponse, IncompleteRead
     from urllib2 import HTTPError as _HTTPError
 
+
 class HTTPError(_HTTPError):
     """Encapsulates HTTP errors (status codes in the 400s and 500s).
 

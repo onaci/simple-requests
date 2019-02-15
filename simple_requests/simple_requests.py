@@ -71,8 +71,8 @@ from gevent.pool import Pool
 from requests import PreparedRequest, Request, Response, Session
 from requests.adapters import HTTPAdapter
 
-from compat import HTTPError
-from strategy import RetryStrategy, Strict
+from .compat import HTTPError
+from .strategy import RetryStrategy, Strict
 
 
 class ResponsePreprocessor(object):
@@ -95,7 +95,7 @@ class ResponsePreprocessor(object):
         return bundle.ret()
 
     def error(self, bundle):
-        raise type(bundle.exception), bundle.exception, bundle.traceback
+        raise   type(bundle.exception)(bundle.exception).with_traceback(bundle.traceback)
 
 
 class Bundle(object):
@@ -104,6 +104,7 @@ class Bundle(object):
         self.response = None
         self.exception = None
         self.traceback = None
+        self.param = None
         self.obj = None
         self.hasobj = False
 
@@ -169,16 +170,19 @@ class _ResponseIterator(object):
                 self._responseAdded.clear()
                 self._responseAdded.wait()
 
+    def __next__(self):
+        return self.next()
+
 
 class _RequestQueue(object):
     def __init__(self):
-        self.queue = [] # requestIterator, nextRequest, responseIterator, group, requestIndex
+        self.queue = [] # requestIterator, nextRequest, responseIterator, group, requestIndex, bundleParam
         self.group = 0
 
-    def add(self, requestIterator, responseIterator):
+    def add(self, requestIterator, responseIterator, bundleParam):
         try:
-            next = requestIterator.next()
-            self.queue.insert(0, [ requestIterator, next, responseIterator, self.group, 0 ])
+            _next = next(requestIterator)
+            self.queue.insert(0, [ requestIterator, _next, responseIterator, self.group, 0, bundleParam ])
             self.group += 1
         except StopIteration:
             responseIterator._done = True
@@ -195,7 +199,7 @@ class _RequestQueue(object):
         ret = tuple(status[1:])
         status[2]._inflight += 1
         try:
-            status[1] = status[0].next()
+            status[1] = next(status[0])
             status[4] += 1
         except StopIteration:
             self.queue.pop(0)
@@ -359,7 +363,7 @@ class Requests(object):
                         continue
                 
                 if retryGroup is None or (reqGroup is not None and reqGroup > retryGroup):
-                    request, responseIterator, group, requestIndex = self._requestQueue.pop()
+                    request, responseIterator, group, requestIndex, bundleParam = self._requestQueue.pop()
                     numTries = 0
 
                     if isinstance(request, tuple):
@@ -369,12 +373,14 @@ class Requests(object):
                     else:
                         bundle = Bundle(request)
 
+                    bundle.param = bundleParam
+
                     if self._skip(bundle):
                         responseIterator._add(bundle, requestIndex)
                         continue
 
                     try:
-                        if isinstance(bundle.request, basestring):
+                        if isinstance(bundle.request, str):
                             bundle.request = Request(method = 'GET', url = bundle.request)
                         if isinstance(bundle.request, Request):
                             bundle.request = self.session.prepare_request(bundle.request)
@@ -402,11 +408,11 @@ class Requests(object):
             except GreenletExit:
                 self._kill()
 
-    def _add(self, requestIterator, maintainOrder, responsePreprocessor):
+    def _add(self, requestIterator, maintainOrder, responsePreprocessor, bundleParam):
         if responsePreprocessor is not None and not isinstance(responsePreprocessor, ResponsePreprocessor):
             raise TypeError('responsePreprocessor must be an instance of ResponsePreprocessor, not %s' % type(responsePreprocessor))
         responseIterator = _ResponseIterator(maintainOrder, responsePreprocessor or self.responsePreprocessor)
-        self._requestQueue.add(requestIterator, responseIterator)
+        self._requestQueue.add(requestIterator, responseIterator, bundleParam)
         self._requestAdded.set()
         return responseIterator
 
@@ -420,6 +426,7 @@ class Requests(object):
         return False
 
     def _execute(self, bundle):
+        bundle.response = None
         try:
             bundle.response = self.session.send(bundle.request)
             self.retryStrategy.verify(bundle)
@@ -472,7 +479,7 @@ class Requests(object):
     def _killall():
         killall(tuple(Requests._runningRequests))
 
-    def one(self, request, responsePreprocessor = None):
+    def one(self, request, responsePreprocessor = None, bundleParam = None):
         """Execute one request synchronously.
 
         Since this request is synchronous, it takes precedence over any other
@@ -484,11 +491,13 @@ class Requests(object):
                         an HTTP ``GET``.
         :param responsePreprocessor: (optional) Override the default
                                      preprocessor for this request only.
+        :param bundleParam: (optional) Attach arbitrary data to the
+                            :class:`Bundle` generated by this method.
         :returns: A :class:`requests.Response`.
         """
-        return self._add([ request ].__iter__(), False, responsePreprocessor).next()
+        return self._add([ request ].__iter__(), False, responsePreprocessor, bundleParam).next()
 
-    def swarm(self, iterable, maintainOrder = True, responsePreprocessor = None):
+    def swarm(self, iterable, maintainOrder = True, responsePreprocessor = None, bundleParam = None):
         """Execute each request asynchronously.
 
         Subsequent calls to :meth:`each`, :meth:`swarm`, or :meth:`one` on the
@@ -514,12 +523,15 @@ class Requests(object):
                               this to False for a slight performance gain.
         :param responsePreprocessor: (optional) Override the default
                                      preprocessor for these requests only.
+        :param bundleParam: (optional) Attach arbitrary data to all the
+                            :class:`Bundle`s generated by this method.
         :returns: A :class:`ResponseIterator` that may be iterated over to get a
                   :class:`requests.Response` for each request.
         """
-        return self._add(iterable.__iter__(), maintainOrder, responsePreprocessor)
+        responseIterator = self._add(iterable.__iter__(), maintainOrder, responsePreprocessor, bundleParam)
+        return iter(responseIterator)
 
-    def each(self, iterable, mapToRequest = (lambda i: i.request), maintainOrder = False, responsePreprocessor = None):
+    def each(self, iterable, mapToRequest = (lambda i: i.request), maintainOrder = False, responsePreprocessor = None, bundleParam = None):
         """Execute a request for each object.
 
         Subsequent calls to :meth:`each`, :meth:`swarm`, or :meth:`one` on the
@@ -546,11 +558,13 @@ class Requests(object):
                               the order is maintained.
         :param responsePreprocessor: (optional) Override the default
                                      preprocessor for these requests only.
+        :param bundleParam: (optional) Attach arbitrary data to all the
+                            :class:`Bundle`s generated by this method.
         :returns: A :class:`ResponseIterator` that may be iterated over to get a
                   (:class:`requests.Response`, object) tuple for each object in
                   the given iterable.
         """
-        return self._add(( ( mapToRequest(i), i ) for i in iterable ), maintainOrder, responsePreprocessor)
+        return self._add(( ( mapToRequest(i), i ) for i in iterable ), maintainOrder, responsePreprocessor, bundleParam)
 
     def stop(self, killExecuting = True):
         """Stop the execution of requests early.

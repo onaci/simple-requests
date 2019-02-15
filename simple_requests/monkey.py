@@ -76,7 +76,7 @@ requests, and even the speed limit isn't helping, your best options are:
 
 from gc import collect
 
-from compat import HTTPResponse, IncompleteRead
+from .compat import HTTPResponse, IncompleteRead
 
 from gevent import sleep, spawn
 from gevent.lock import BoundedSemaphore
